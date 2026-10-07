@@ -1,0 +1,32 @@
+{
+  "id": "gifdrop",
+  "name": "GifDrop",
+  "version": "1.0.0",
+  "summary": "Quickly convert any file into .gif",
+  "category": "Media",
+  "kit": {
+    "abi": 1,
+    "minAPI": "1.6.0"
+  },
+  "minAppVersion": "15.3.0",
+  "capabilities": [
+    "hud"
+  ],
+  "surfaces": [
+    "shelf-widget",
+    "live-activity",
+    "hud"
+  ],
+  "icon": "GifDrop.icon",
+  "creator": {
+    "name": "Loukas1212",
+    "kind": "community",
+    "url": "https://github.com/loukas1212",
+    "avatar": "Creator.png",
+    "gitlab": "t56944589"
+  },
+  "source": {
+    "repository": "https://gitlab.com/droppyformac1/droplets/-/tree/main/droplets/gifdrop",
+    "license": "MIT"
+  }
+}
