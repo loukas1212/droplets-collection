@@ -1,0 +1,6 @@
+.build/
+.vscode/
+Package.resolved
+.DS_Store
+Disks/.DS_Store
+GifDrop/.DS_Store
