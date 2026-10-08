@@ -19,11 +19,33 @@ struct DiskIcon: @unchecked Sendable {
     let image: NSImage
 }
 
+struct PartitionInfo: Identifiable, Sendable {
+    let id: String
+    let name: String
+    let bytes: Int64
+    /// The partition that holds the disk shown in the widget.
+    let isCurrent: Bool
+}
+
+struct PartitionLayout: Sendable {
+    let totalBytes: Int64
+    let partitions: [PartitionInfo]
+}
+
+enum PartitionResult: Sendable {
+    case loaded(PartitionLayout)
+    case unavailable
+}
+
 struct MountedDisk: Identifiable, Sendable {
     let url: URL
     let name: String
     let icon: DiskIcon
     let canEject: Bool
+    let isLocal: Bool
+    let isInternal: Bool?
+    let isReadOnly: Bool?
+    let formatDescription: String?
     let totalBytes: Int64?
     let availableBytes: Int64?
 
@@ -38,6 +60,13 @@ struct MountedDisk: Identifiable, Sendable {
     var usedFraction: Double? {
         guard let totalBytes, totalBytes > 0, let usedBytes else { return nil }
         return min(1, Double(usedBytes) / Double(totalBytes))
+    }
+
+    /// "APFS · Internal · Writable"
+    var factsText: String {
+        let location = !isLocal ? "Network" : (isInternal.map { $0 ? "Internal" : "External" } ?? "Unknown")
+        let access = isReadOnly.map { $0 ? "Read-only" : "Writable" } ?? "Unknown access"
+        return [formatDescription, location, access].compactMap { $0 }.joined(separator: " · ")
     }
 
     var usageText: String {
@@ -65,6 +94,7 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
     /// plain GCD queues: a blocked network share or drive never takes a thread from
     /// Swift's shared concurrency pool, which Droppy uses for its own async work.
     private static let scanQueue = DispatchQueue(label: "app.droppy.disks.scan", qos: .utility)
+    private static let infoQueue = DispatchQueue(label: "app.droppy.disks.info", qos: .utility)
     private static let ejectQueue = DispatchQueue(
         label: "app.droppy.disks.eject", qos: .userInitiated, attributes: .concurrent
     )
@@ -74,6 +104,11 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
     @Published private(set) var isLoaded = false
     /// Disk shown in the detail view (nil = list).
     @Published private(set) var selectedID: String?
+    /// The detail view shows disk information and partitions instead of the usage bar.
+    @Published private(set) var showInfo = false
+    /// Partition layouts already read, by disk id.
+    @Published private(set) var layouts: [String: PartitionResult] = [:]
+    private var layoutLoading: Set<String> = []
     /// Disks currently being ejected.
     @Published private(set) var ejecting: Set<String> = []
     /// Reason of the last failed eject, shown in the widget.
@@ -131,7 +166,8 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
         let keys: [URLResourceKey] = [
             .volumeNameKey, .volumeIsEjectableKey, .volumeIsRemovableKey, .volumeIsLocalKey,
             .volumeTotalCapacityKey, .volumeAvailableCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeLocalizedFormatDescriptionKey, .volumeIsInternalKey, .volumeIsReadOnlyKey
         ]
         let urls = FileManager.default.mountedVolumeURLs(
             includingResourceValuesForKeys: keys,
@@ -154,6 +190,10 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
                 name: values?.volumeName ?? url.lastPathComponent,
                 icon: DiskIcon(image: NSWorkspace.shared.icon(forFile: url.path)),
                 canEject: ejectable && !isBoot,
+                isLocal: values?.volumeIsLocal ?? true,
+                isInternal: values?.volumeIsInternal,
+                isReadOnly: values?.volumeIsReadOnly,
+                formatDescription: values?.volumeLocalizedFormatDescription,
                 totalBytes: total,
                 availableBytes: available
             )
@@ -201,11 +241,14 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
         disks = list
         isLoaded = true
         ejecting.formIntersection(list.map(\.id))
+        let liveIDs = Set(list.map(\.id))
+        layouts = layouts.filter { liveIDs.contains($0.key) }
 
         // The disk shown has disappeared (ejected): back to the list.
         var selectionDropped = false
         if let selectedID, !list.contains(where: { $0.id == selectedID }) {
             self.selectedID = nil
+            self.showInfo = false
             selectionDropped = true
         }
 
@@ -218,19 +261,147 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
 
     func select(_ disk: MountedDisk) {
         selectedID = disk.id
+        showInfo = false
         host?.shelf.invalidateLayout(for: Self.widgetID)
         refresh()   // fresh capacities, in the background
     }
 
     func deselect() {
         selectedID = nil
+        showInfo = false
         host?.shelf.invalidateLayout(for: Self.widgetID)
+    }
+
+    /// Back: from the info view to the usage view, then to the list.
+    func back() {
+        if showInfo {
+            showInfo = false
+            host?.shelf.invalidateLayout(for: Self.widgetID)
+        } else {
+            deselect()
+        }
+    }
+
+    func toggleInfo() {
+        guard let disk = selectedDisk else { return }
+        showInfo.toggle()
+        host?.shelf.invalidateLayout(for: Self.widgetID)
+        if showInfo { loadLayout(for: disk) }
     }
 
     // MARK: Actions
 
     func open(_ disk: MountedDisk) {
         NSWorkspace.shared.open(disk.url)
+    }
+
+    // MARK: Partitions (on their own serial queue, with a timeout)
+
+    private func loadLayout(for disk: MountedDisk) {
+        guard layouts[disk.id] == nil, !layoutLoading.contains(disk.id) else { return }
+        layoutLoading.insert(disk.id)
+        let id = disk.id
+        let path = disk.url.path
+        let name = disk.name
+        let isLocal = disk.isLocal
+        DisksDroplet.infoQueue.async { [weak self] in
+            let result = DisksDroplet.readLayout(path: path, volumeName: name, isLocal: isLocal)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.layoutLoaded(id: id, result: result) }
+            }
+        }
+    }
+
+    private func layoutLoaded(id: String, result: PartitionResult) {
+        layoutLoading.remove(id)
+        guard host != nil else { return }
+        layouts[id] = result
+    }
+
+    /// `statfs` gives the BSD device of a mounted volume ("disk3s1s1").
+    nonisolated private static func bsdName(forMountPoint path: String) -> String? {
+        var st = statfs()
+        guard statfs(path, &st) == 0 else { return nil }
+        let from = withUnsafePointer(to: &st.f_mntfromname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        guard from.hasPrefix("/dev/") else { return nil }
+        return String(from.dropFirst(5))
+    }
+
+    /// Runs `diskutil … -plist` and gives up after 8 seconds.
+    nonisolated private static func runDiskutil(_ arguments: [String]) -> [String: Any]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do { try process.run() } catch { return nil }
+        if finished.wait(timeout: .now() + 8) == .timedOut {
+            process.terminate()
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
+    }
+
+    nonisolated private static func partitionLabel(
+        content: String, volumeName: String?, isCurrent: Bool, currentVolume: String
+    ) -> String {
+        if let volumeName, !volumeName.isEmpty { return volumeName }
+        switch content {
+        case "Apple_APFS": return isCurrent ? "APFS Container (\(currentVolume))" : "APFS Container"
+        case "Apple_APFS_Recovery": return "Recovery"
+        case "Apple_APFS_ISC": return "System Boot"
+        case "EFI": return "EFI"
+        default: return content.isEmpty ? "Partition" : content
+        }
+    }
+
+    /// Partitions of the physical disk that holds `path`. For an APFS volume this is the
+    /// disk under the APFS container (iBoot, container, Recovery…), not the container itself.
+    nonisolated private static func readLayout(path: String, volumeName: String, isLocal: Bool) -> PartitionResult {
+        guard isLocal,
+              let bsd = bsdName(forMountPoint: path),
+              let info = runDiskutil(["info", "-plist", bsd]) else { return .unavailable }
+
+        let stores = info["APFSPhysicalStores"] as? [[String: Any]]
+        let storeID = stores?.first?["APFSPhysicalStore"] as? String
+        let currentID = storeID ?? bsd
+
+        let digits = currentID.dropFirst(4).prefix { $0.isNumber }
+        guard currentID.hasPrefix("disk"), !digits.isEmpty else { return .unavailable }
+        let whole = "disk" + digits
+
+        guard let list = runDiskutil(["list", "-plist", whole]),
+              let entries = list["AllDisksAndPartitions"] as? [[String: Any]],
+              let entry = entries.first(where: { ($0["DeviceIdentifier"] as? String) == whole }) ?? entries.first,
+              let total = (entry["Size"] as? NSNumber)?.int64Value else { return .unavailable }
+
+        let raw = entry["Partitions"] as? [[String: Any]] ?? []
+        var partitions: [PartitionInfo] = raw.compactMap { partition in
+            guard let id = partition["DeviceIdentifier"] as? String,
+                  let size = (partition["Size"] as? NSNumber)?.int64Value else { return nil }
+            let isCurrent = id == currentID
+            return PartitionInfo(
+                id: id,
+                name: partitionLabel(
+                    content: partition["Content"] as? String ?? "",
+                    volumeName: partition["VolumeName"] as? String,
+                    isCurrent: isCurrent,
+                    currentVolume: volumeName
+                ),
+                bytes: size,
+                isCurrent: isCurrent
+            )
+        }
+        if partitions.isEmpty {
+            partitions = [PartitionInfo(id: whole, name: volumeName, bytes: total, isCurrent: true)]
+        }
+        return .loaded(PartitionLayout(totalBytes: total, partitions: partitions))
     }
 
     func eject(_ disk: MountedDisk) {
@@ -285,6 +456,8 @@ public final class DisksDroplet: NSObject, ObservableObject, Droplet {
 
 struct StorageBarView: View {
     let fraction: Double?
+    var height: CGFloat = DisksLayout.barHeight
+    var emphasized = true
 
     var body: some View {
         GeometryReader { proxy in
@@ -293,12 +466,14 @@ struct StorageBarView: View {
                     .fill(AdaptiveColors.notchSurfaceCardFill)
                 if let fraction {
                     Capsule(style: .continuous)
-                        .fill(AdaptiveColors.notchSurfacePrimaryText)
-                        .frame(width: max(DisksLayout.barHeight, proxy.size.width * fraction))
+                        .fill(emphasized
+                              ? AdaptiveColors.notchSurfacePrimaryText
+                              : AdaptiveColors.notchSurfaceTertiaryText)
+                        .frame(width: max(height, proxy.size.width * fraction))
                 }
             }
         }
-        .frame(height: DisksLayout.barHeight)
+        .frame(height: height)
     }
 }
 
@@ -308,7 +483,7 @@ extension DisksDroplet: ShelfWidgetProviding {
     public var widgetDescriptors: [ShelfWidgetDescriptor] {
         var height: CGFloat
         if selectedDisk != nil {
-            height = DisksLayout.detailHeight
+            height = showInfo ? DisksLayout.infoHeight : DisksLayout.detailHeight
         } else {
             let rows = max(1, min(disks.count, DisksLayout.maxVisibleRows))
             let content = DisksLayout.headerHeight + DisksLayout.rowHeight * CGFloat(rows)
@@ -351,6 +526,9 @@ enum DisksLayout {
     static let maxVisibleRows = 5
     /// 16 insets + 20 header + 8 + 28 row + 8 + 8 bar + 8 + 16 text
     static let detailHeight: CGFloat = 112
+    /// 16 insets + 20 header + 8 + 28 row + 8 + 16 facts + 8 + 112 partitions
+    static let infoHeight: CGFloat = 216
+    static let partitionsAreaHeight: CGFloat = 112
     static let barHeight: CGFloat = 8
     static let errorHeight: CGFloat = 30
 }
@@ -391,11 +569,11 @@ struct DisksWidget: View {
     private var header: some View {
         HStack(spacing: DroppySpacing.xsm) {
             if !context.isCompact, droplet.selectedDisk != nil {
-                Button { droplet.deselect() } label: {
+                Button { droplet.back() } label: {
                     Image(systemName: "chevron.left")
                 }
                 .buttonStyle(DroppyCircleButtonStyle(size: 20))
-                .help("Back to all disks")
+                .help(droplet.showInfo ? "Back to storage" : "Back to all disks")
             } else {
                 Image(systemName: "externaldrive").font(.system(size: 12, weight: .medium))
             }
@@ -467,19 +645,81 @@ struct DisksWidget: View {
             HStack(spacing: DroppySpacing.sm) {
                 diskLabel(disk)
                 Spacer(minLength: DroppySpacing.md)
-                actionButtons(disk)
+                actionButtons(disk, showInfo: true)
             }
             .frame(height: DisksLayout.rowHeight)
             .droppyFlatGlassControls()
 
-            StorageBarView(fraction: disk.usedFraction)
+            if droplet.showInfo {
+                infoBody(disk)
+            } else {
+                StorageBarView(fraction: disk.usedFraction)
 
-            Text(disk.usageText)
-                .font(.system(size: 12, weight: .medium))
-                .monospacedDigit()
-                .lineLimit(1)
-                .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
-                .frame(height: 16, alignment: .leading)
+                Text(disk.usageText)
+                    .font(.system(size: 12, weight: .medium))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
+                    .frame(height: 16, alignment: .leading)
+            }
+        }
+    }
+
+    // MARK: Info: format, location, access, then the partitions with a bar each
+
+    @ViewBuilder private func infoBody(_ disk: MountedDisk) -> some View {
+        Text(disk.factsText)
+            .font(.system(size: 12, weight: .medium))
+            .lineLimit(1)
+            .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
+            .frame(height: 16, alignment: .leading)
+
+        Group {
+            switch droplet.layouts[disk.id] {
+            case .none:
+                Text("Reading partitions…")
+                    .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
+            case .some(.unavailable):
+                Text("Partitions aren't available for this disk")
+                    .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
+            case .some(.loaded(let layout)):
+                partitionList(layout)
+            }
+        }
+        .font(.system(size: 12))
+        .frame(maxWidth: .infinity, minHeight: 0,
+               maxHeight: DisksLayout.partitionsAreaHeight, alignment: .topLeading)
+    }
+
+    private func partitionList(_ layout: PartitionLayout) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: DroppySpacing.sm) {
+                ForEach(layout.partitions) { partition in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(partition.name)
+                                .font(.system(size: 11, weight: .semibold))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundStyle(partition.isCurrent
+                                                 ? AdaptiveColors.notchSurfacePrimaryText
+                                                 : AdaptiveColors.notchSurfaceSecondaryText)
+                            Spacer(minLength: DroppySpacing.md)
+                            Text(ByteCountFormatter.string(fromByteCount: partition.bytes, countStyle: .file))
+                                .font(.system(size: 11))
+                                .monospacedDigit()
+                                .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
+                        }
+                        StorageBarView(
+                            fraction: layout.totalBytes > 0
+                                ? Double(partition.bytes) / Double(layout.totalBytes)
+                                : 0,
+                            height: 6,
+                            emphasized: partition.isCurrent
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -498,9 +738,17 @@ struct DisksWidget: View {
         }
     }
 
-    private func actionButtons(_ disk: MountedDisk) -> some View {
+    private func actionButtons(_ disk: MountedDisk, showInfo: Bool = false) -> some View {
         let isEjecting = droplet.ejecting.contains(disk.id)
         return HStack(spacing: DroppySpacing.sm) {
+            if showInfo {
+                Button { droplet.toggleInfo() } label: {
+                    Image(systemName: droplet.showInfo ? "info.circle.fill" : "info.circle")
+                }
+                .buttonStyle(DroppyCircleButtonStyle(size: 24))
+                .help("Disk information and partitions")
+            }
+
             Button { droplet.open(disk) } label: {
                 Image(systemName: "folder")
             }

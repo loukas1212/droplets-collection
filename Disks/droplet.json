@@ -1,7 +1,7 @@
 {
   "id": "disks",
   "name": "Disks",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "summary": "Your mounted disks on the shelf, with Open and Eject buttons",
   "description": "Disks lists every volume mounted on your Mac right on the shelf, with its icon and name. Each row has an Open button that shows the disk in Finder and an Eject button that unmounts it safely. Click a disk to see how much of it is used, as a bar and a figure. If a disk can't be ejected, for example because a file is still open on it, Disks tells you why. Paired with another widget, the card lists your disks by name.",
   "category": "Productivity",
