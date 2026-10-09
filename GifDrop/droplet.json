@@ -1,7 +1,7 @@
 {
   "id": "gifdrop",
   "name": "GifDrop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "summary": "Quickly convert any file into .gif",
   "category": "Media",
   "kit": {
@@ -26,7 +26,7 @@
     "gitlab": "t56944589"
   },
   "source": {
-    "repository": "https://gitlab.com/droppyformac1/droplets/-/tree/main/droplets/gifdrop",
+    "repository": "https://github.com/loukas1212/droplet-gifdrop",
     "license": "MIT"
   }
 }

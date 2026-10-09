@@ -1,5 +1,8 @@
 # Changelog
 
+## [1.0.1] - 2026-10-09
+- Changed the repo URL inside `droplet.json`
+
 ## [1.0.0] - 2026-10-03
 
 - Added video and image to GIF conversion with FFmpeg, using a two-pass palette encode for accurate colours.
