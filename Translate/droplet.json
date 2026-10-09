@@ -1,0 +1,30 @@
+{
+  "id": "translate",
+  "name": "Translate",
+  "version": "1.0.0",
+  "summary": "Translate text on the shelf, on your Mac, totally offline",
+  "description": "Type or paste text on the shelf and translate it between any two languages you choose, entirely on your Mac. Auto-detect the source language, swap languages in one click, translate while typing, and copy, paste, or listen to results. Powered by Apple's on-device Translation framework, no network, accounts, or API keys, nothing ever leaves your Mac.",
+  "category": "Productivity",
+  "kit": {
+    "abi": 1,
+    "minAPI": "1.20.1"
+  },
+  "minAppVersion": "16.0.1",
+  "capabilities": [],
+  "surfaces": [
+    "shelf-widget",
+    "settings-pane"
+  ],
+  "icon": "Translate.icon",
+  "creator": {
+    "name": "Loukas1212",
+    "kind": "community",
+    "url": "https://github.com/loukas1212",
+    "avatar": "Creator.png",
+    "gitlab": "t56944589"
+  },
+  "source": {
+    "repository": "https://github.com/loukas1212/droplets-collection",
+    "license": "MIT"
+  }
+}
